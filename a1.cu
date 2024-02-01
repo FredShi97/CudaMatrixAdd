@@ -3,8 +3,8 @@
 #include <sys/time.h>
 
 
-#define BLOCK_SIZE_ROW 16
-#define BLOCK_SIZE_COL 16
+#define BLOCK_SIZE_ROW 32
+#define BLOCK_SIZE_COL 32
 
 double getTimeStamp() {
     struct timeval  tv ; gettimeofday( &tv, NULL ) ;
@@ -16,35 +16,47 @@ __global__ void f_siggen(float *d_x, float *d_y, float *d_z, int row_size, int c
     
     //add one row above and one row below to accommendate for row - 1 and row + 1 read
     __shared__ float x_shared[(BLOCK_SIZE_ROW + 2) * BLOCK_SIZE_COL]; 
+    __shared__ float y_shared[BLOCK_SIZE_ROW * (BLOCK_SIZE_COL + 2)]; 
     
     int x = blockDim.x * blockIdx.x + threadIdx.x;
     int y = blockDim.y * blockIdx.y + threadIdx.y;
     int offset; 
-    int shared_index;
+    int shared_index_X;
+    int shared_index_Y; 
 
     if (x < col_size && y < row_size){
         offset = y * col_size + x;  
-        shared_index = (threadIdx.y + 1) * blockDim.x + threadIdx.x; 
+        shared_index_Y = threadIdx.y * blockDim.x + threadIdx.x + 2; 
+        shared_index_X = (threadIdx.y + 1) * blockDim.x + threadIdx.x; 
         //copy out d_x based on block index
-        x_shared[shared_index] = d_x[offset]; 
+        x_shared[shared_index_X] = d_x[offset]; 
+        y_shared[shared_index_Y] = d_y[offset]; 
+
         //if its first row, copy out one row above from d_x
         if (threadIdx.y == 0 && (y - 1 >= 0))
             x_shared[threadIdx.x] = d_x[(y - 1) * col_size + x]; 
         //if its last row, copy out one row below from d_x
         if ((threadIdx.y == blockDim.y - 1) && (y + 1 < row_size))
             x_shared[(threadIdx.y + 2) * blockDim.x + threadIdx.x] = d_x[(y + 1) * col_size + x];
+
+        if (threadIdx.x == 0 && x - 2 >= 0)
+            y_shared[threadIdx.y * blockDim.x] = d_y[offset - 2]; 
+        
+        if (threadIdx.x == 1 && x - 1 >= 0)
+            y_shared[threadIdx.y * blockDim.x + 1] = d_y[offset - 1]; 
+        
     }
     
      __syncthreads(); 
 
     if (x < col_size && y < row_size){
-        float output = x_shared[shared_index] - d_y[offset]; 
+        float output = x_shared[shared_index_X] - y_shared[shared_index_Y]; 
 
         //coalesced access. 
         if (x - 1 >= 0) 
-            output -= d_y[y * col_size + x - 1];
+            output -= y_shared[shared_index_Y - 1];
         if (x - 2 >= 0)
-            output -= d_y[y * col_size + x - 2]; 
+            output -= y_shared[shared_index_Y - 2]; 
 
         // read from shared memory 
         if (y - 1 >= 0)
@@ -72,9 +84,9 @@ int main(int argc, char **argv) {
     float *h_x, *h_y, *h_z, *d_x, *d_y, *d_z; 
     int n_size = row_size * col_size;
 
-    cudaHostAlloc((void**) &h_x, n_size * sizeof(float), 0); 
-    cudaHostAlloc((void**) &h_y, n_size * sizeof(float), 0); 
-    cudaHostAlloc((void**) &h_z, n_size * sizeof(float), 0); 
+    cudaHostAlloc((void**) &h_x, n_size * sizeof(float), cudaHostAllocWriteCombined); 
+    cudaHostAlloc((void**) &h_y, n_size * sizeof(float), cudaHostAllocWriteCombined); 
+    cudaHostAlloc((void**) &h_z, n_size * sizeof(float), cudaHostAllocWriteCombined); 
     cudaMalloc((void**) &d_x, n_size * sizeof(float));
     cudaMalloc((void**) &d_y, n_size * sizeof(float));
     cudaMalloc((void**) &d_z, n_size * sizeof(float));
@@ -86,8 +98,6 @@ int main(int argc, char **argv) {
             h_y[offset] = (float) 3.25 * ((i+j) % 100); 
         }
     }
-
-
 
     dim3 blockSize(BLOCK_SIZE_COL, BLOCK_SIZE_ROW); 
     int gridX = (col_size + blockSize.x - 1) / blockSize.x;
@@ -119,15 +129,13 @@ int main(int argc, char **argv) {
     double total_time = endTime - totalStartTime; 
 
 
-    cudaFree(d_x);
-    cudaFree(d_y);
-    cudaFree(d_z); 
-
-
     printf("%f %f %f %f %f \n", total_time, CPU_GPU_Transfer_time, kernel_time, 
     GPU_CPU_Transfer_time, h_z[5*col_size + 5]);
 
     
+
+    
+    /*
     for (int i = 0; i < row_size; i++){
         for (int j = 0; j < col_size; j++){
             int offset = i * col_size + j; 
@@ -148,7 +156,11 @@ int main(int argc, char **argv) {
                 printf("CPU calculated is %f, GPU is %f, row %d, col %d \n", out, h_z[offset], i, j);
         }
     }
+    */
 
+    cudaFree(d_x);
+    cudaFree(d_y);
+    cudaFree(d_z); 
     cudaFreeHost(h_x);
     cudaFreeHost(h_y);
     cudaFreeHost(h_z);
@@ -156,4 +168,3 @@ int main(int argc, char **argv) {
 
     return 0;
 }
-
