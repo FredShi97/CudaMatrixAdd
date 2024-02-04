@@ -3,13 +3,14 @@
 #include <sys/time.h>
 
 
-#define BLOCK_SIZE_ROW 32
-#define BLOCK_SIZE_COL 32
+#define BLOCK_SIZE_ROW 16
+#define BLOCK_SIZE_COL 16
 
 double getTimeStamp() {
     struct timeval  tv ; gettimeofday( &tv, NULL ) ;
     return (double) tv.tv_usec/1000000 + tv.tv_sec ;
 }
+
 
 
 __global__ void f_siggen(float *d_x, float *d_y, float *d_z, int row_size, int col_size){
@@ -26,7 +27,7 @@ __global__ void f_siggen(float *d_x, float *d_y, float *d_z, int row_size, int c
 
     if (x < col_size && y < row_size){
         offset = y * col_size + x;  
-        shared_index_Y = threadIdx.y * blockDim.x + threadIdx.x + 2; 
+        shared_index_Y = threadIdx.y * (blockDim.x + 2) + threadIdx.x + 2; 
         shared_index_X = (threadIdx.y + 1) * blockDim.x + threadIdx.x; 
         //copy out d_x based on block index
         x_shared[shared_index_X] = d_x[offset]; 
@@ -39,11 +40,11 @@ __global__ void f_siggen(float *d_x, float *d_y, float *d_z, int row_size, int c
         if ((threadIdx.y == blockDim.y - 1) && (y + 1 < row_size))
             x_shared[(threadIdx.y + 2) * blockDim.x + threadIdx.x] = d_x[(y + 1) * col_size + x];
 
-        if (threadIdx.x == 0 && x - 2 >= 0)
-            y_shared[threadIdx.y * blockDim.x] = d_y[offset - 2]; 
+        if (threadIdx.x == 0 && (x - 2 >= 0))
+            y_shared[threadIdx.y * (blockDim.x + 2)] = d_y[offset - 2]; 
         
-        if (threadIdx.x == 1 && x - 1 >= 0)
-            y_shared[threadIdx.y * blockDim.x + 1] = d_y[offset - 1]; 
+        if (threadIdx.x == 0 && (x - 1 >= 0))
+            y_shared[threadIdx.y * (blockDim.x + 2) + 1] = d_y[offset - 1]; 
         
     }
     
@@ -51,7 +52,6 @@ __global__ void f_siggen(float *d_x, float *d_y, float *d_z, int row_size, int c
 
     if (x < col_size && y < row_size){
         float output = x_shared[shared_index_X] - y_shared[shared_index_Y]; 
-
         //coalesced access. 
         if (x - 1 >= 0) 
             output -= y_shared[shared_index_Y - 1];
@@ -74,7 +74,7 @@ __global__ void f_siggen(float *d_x, float *d_y, float *d_z, int row_size, int c
 int main(int argc, char **argv) {
 
     if (argc != 3){
-        printf("Program takes 3 args, <row_size> <col_size>"); 
+        printf("Program takes 2 args, <row_size> <col_size>"); 
         return 0; 
     }
 
@@ -84,18 +84,17 @@ int main(int argc, char **argv) {
     float *h_x, *h_y, *h_z, *d_x, *d_y, *d_z; 
     int n_size = row_size * col_size;
 
-    cudaHostAlloc((void**) &h_x, n_size * sizeof(float), cudaHostAllocWriteCombined); 
-    cudaHostAlloc((void**) &h_y, n_size * sizeof(float), cudaHostAllocWriteCombined); 
+    cudaHostAlloc((void**) &h_x, n_size * sizeof(float) * 2, cudaHostAllocWriteCombined); 
     cudaHostAlloc((void**) &h_z, n_size * sizeof(float), cudaHostAllocWriteCombined); 
-    cudaMalloc((void**) &d_x, n_size * sizeof(float));
-    cudaMalloc((void**) &d_y, n_size * sizeof(float));
+    cudaMalloc((void**) &d_x, n_size * sizeof(float) * 2);
     cudaMalloc((void**) &d_z, n_size * sizeof(float));
+
 
     for (int i = 0; i < row_size; i++){
         for (int j = 0; j < col_size; j++){
             int offset = i * col_size + j; 
             h_x[offset] = (float) ((i+j) % 100) / 2.0; 
-            h_y[offset] = (float) 3.25 * ((i+j) % 100); 
+            h_x[offset + n_size] = (float) 3.25 * ((i+j) % 100); 
         }
     }
 
@@ -105,37 +104,29 @@ int main(int argc, char **argv) {
     dim3 gridSize(gridX, gridY); 
 
 
-    double startTime = getTimeStamp(); 
-    double endTime; 
-    double totalStartTime = startTime; 
+    d_y = &d_x[n_size];
+    h_y = &h_x[n_size]; 
+    
 
-    cudaMemcpy(d_x, h_x, n_size * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_y, h_y, n_size * sizeof(float), cudaMemcpyHostToDevice);
+    double startTime, CPUTransferEndTime, KernelEndTime, GPUTransferEndTime;
+    startTime = getTimeStamp(); 
+    
 
-    endTime = getTimeStamp();
-    double CPU_GPU_Transfer_time = endTime - startTime; 
-    startTime = endTime;
+    cudaMemcpy(d_x, h_x, n_size * sizeof(float) * 2, cudaMemcpyHostToDevice);
+
+    CPUTransferEndTime = getTimeStamp();
 
     f_siggen<<<gridSize,blockSize>>>(d_x, d_y, d_z, row_size, col_size); 
-    cudaDeviceSynchronize(); 
-    endTime = getTimeStamp();
-    double kernel_time = endTime - startTime; 
-    startTime = endTime;
+    KernelEndTime = getTimeStamp();
 
     cudaMemcpy(h_z, d_z, n_size * sizeof(float), cudaMemcpyDeviceToHost);
-    endTime = getTimeStamp();
-    double GPU_CPU_Transfer_time = endTime - startTime; 
+    GPUTransferEndTime = getTimeStamp();
 
-    double total_time = endTime - totalStartTime; 
-
-
-    printf("%f %f %f %f %f \n", total_time, CPU_GPU_Transfer_time, kernel_time, 
-    GPU_CPU_Transfer_time, h_z[5*col_size + 5]);
+    printf("%.6f %.6f %.6f %.6f %.6f \n", GPUTransferEndTime - startTime, CPUTransferEndTime - startTime , KernelEndTime - CPUTransferEndTime, 
+    GPUTransferEndTime - KernelEndTime, h_z[5*col_size + 5]);
 
     
 
-    
-    /*
     for (int i = 0; i < row_size; i++){
         for (int j = 0; j < col_size; j++){
             int offset = i * col_size + j; 
@@ -156,13 +147,11 @@ int main(int argc, char **argv) {
                 printf("CPU calculated is %f, GPU is %f, row %d, col %d \n", out, h_z[offset], i, j);
         }
     }
-    */
+    
 
     cudaFree(d_x);
-    cudaFree(d_y);
     cudaFree(d_z); 
     cudaFreeHost(h_x);
-    cudaFreeHost(h_y);
     cudaFreeHost(h_z);
   
 
