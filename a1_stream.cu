@@ -13,7 +13,9 @@ double getTimeStamp() {
     return (double) tv.tv_usec/1000000 + tv.tv_sec ;
 }
 
-
+void recordTimeCallback(cudaStream_t stream, cudaError_t status, void *data){
+    *((double *)data)  = getTimeStamp();
+}
 
 __global__ void f_siggen(float *d_x, float *d_y, float *d_z, int row_size, int col_size){
     
@@ -88,12 +90,12 @@ int main(int argc, char **argv) {
     float *h_x, *h_y, *h_z, *d_x, *d_y, *d_z; 
     int n_size = row_size * col_size;
 
-    // cudaHostAlloc((void**) &h_x, n_size * sizeof(float), cudaHostAllocWriteCombined); 
-    // cudaHostAlloc((void**) &h_y, n_size * sizeof(float), cudaHostAllocWriteCombined); 
-    // cudaHostAlloc((void**) &h_z, n_size * sizeof(float), cudaHostAllocWriteCombined); 
-    cudaHostAlloc((void**) &h_x, n_size * sizeof(float), 0); 
-    cudaHostAlloc((void**) &h_y, n_size * sizeof(float), 0); 
-    cudaHostAlloc((void**) &h_z, n_size * sizeof(float), 0); 
+    cudaHostAlloc((void**) &h_x, n_size * sizeof(float), cudaHostAllocWriteCombined); 
+    cudaHostAlloc((void**) &h_y, n_size * sizeof(float), cudaHostAllocWriteCombined); 
+    cudaHostAlloc((void**) &h_z, n_size * sizeof(float), cudaHostAllocWriteCombined); 
+    // cudaHostAlloc((void**) &h_x, n_size * sizeof(float), 0); 
+    // cudaHostAlloc((void**) &h_y, n_size * sizeof(float), 0); 
+    // cudaHostAlloc((void**) &h_z, n_size * sizeof(float), 0); 
     cudaMalloc((void**) &d_x, n_size * sizeof(float));
     cudaMalloc((void**) &d_y, n_size * sizeof(float));
     cudaMalloc((void**) &d_z, n_size * sizeof(float));
@@ -117,12 +119,6 @@ int main(int argc, char **argv) {
 
     cudaStream_t stream[N_STREAMS + 1]; 
 
-
-    double startTime; 
-
-    
-
-
     size_t trunkSize; 
     if (row_size % 2 == 0 || row_size == 1)
         trunkSize = col_size * (row_size / 2 + 1) * sizeof(float);
@@ -137,22 +133,28 @@ int main(int argc, char **argv) {
     int reminderSize = n_size - n_size / 2; 
 
     //printf("second Trunk offset %d, trunk size %d \n", secondTrunkOffset, trunkSize);
-    
+    int rowLimits = row_size / 2 + 1;
+    if (row_size % 2 == 1)
+        rowLimits = row_size / 2 + 2;
+
+    double startTime, CPUTransferFinishTime, kernelFinishTime, endTime;
+
     startTime = getTimeStamp(); 
 
     
-
     cudaStreamCreate(&stream[1]); 
     cudaMemcpyAsync(&d_x[0], &h_x[0], trunkSize, cudaMemcpyHostToDevice, stream[1]);
     cudaMemcpyAsync(&d_y[0], &h_y[0], trunkSize, cudaMemcpyHostToDevice, stream[1]);
-    f_siggen<<<gridSize,blockSize>>>(&d_x[0], &d_y[0], &d_z[0], row_size / 2 + 1, col_size); 
+    f_siggen<<<gridSize,blockSize>>>(&d_x[0], &d_y[0], &d_z[0], rowLimits, col_size); 
     cudaMemcpyAsync(&h_z[0], &d_z[0], (n_size / 2) * sizeof(float), cudaMemcpyDeviceToHost, stream[1]);
 
 
     cudaStreamCreate(&stream[2]); 
     cudaMemcpyAsync(&d_x[secondTrunkOffset], &h_x[secondTrunkOffset], trunkSize, cudaMemcpyHostToDevice, stream[2]);
     cudaMemcpyAsync(&d_y[secondTrunkOffset], &h_y[secondTrunkOffset], trunkSize, cudaMemcpyHostToDevice, stream[2]);
-    f_siggen<<<gridSize,blockSize>>>(&d_x[secondTrunkOffset], &d_y[secondTrunkOffset], &d_z[secondTrunkOffset], row_size / 2 + 1, col_size); 
+    cudaStreamAddCallback(stream[2], recordTimeCallback, (void*) &CPUTransferFinishTime, 0);
+    f_siggen<<<gridSize,blockSize>>>(&d_x[secondTrunkOffset], &d_y[secondTrunkOffset], &d_z[secondTrunkOffset], rowLimits, col_size); 
+    cudaStreamAddCallback(stream[2], recordTimeCallback, (void*) &kernelFinishTime, 0);
     cudaMemcpyAsync(&h_z[n_size / 2], &d_z[n_size / 2], reminderSize * sizeof(float), cudaMemcpyDeviceToHost, stream[2]);
    
     
@@ -161,7 +163,7 @@ int main(int argc, char **argv) {
     
 
 
-    double endTime = getTimeStamp(); 
+    endTime = getTimeStamp(); 
 
 
     if (stream1Error != 0 || stream2Error != 0){
@@ -176,7 +178,7 @@ int main(int argc, char **argv) {
     }
 
 
-    volatile float res = h_z[5*col_size + 5]; 
+   
     
 
     for (int i = 0; i < row_size; i++){
@@ -194,7 +196,7 @@ int main(int argc, char **argv) {
                 out -= h_y[i * col_size + j - 2];   
 
             if (h_z[offset] != out){
-                printf("Error: calculated difference at row %d, col %d \n", i, j);
+                printf("Error: calculated difference at row %d, col %d, CPU is %f, GPU is %f \n", i, j, out, h_z[offset]);
                 cudaFree(d_x);
                 cudaFree(d_z); 
                 cudaFreeHost(h_x);
@@ -207,8 +209,10 @@ int main(int argc, char **argv) {
         }
     }
 
-    printf("%.6f %.6f %.6f %.6f %.6f \n", endTime - startTime, 0.0 , 0.0, 
-    0.0, res);
+    volatile float res = h_z[5*col_size + 5]; 
+
+    printf("%.6f %.6f %.6f %.6f %.6f \n", endTime - startTime, CPUTransferFinishTime - startTime , 
+    kernelFinishTime - CPUTransferFinishTime, endTime - kernelFinishTime, res);
 
 
     cudaFree(d_x);
